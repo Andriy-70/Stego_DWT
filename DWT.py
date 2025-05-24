@@ -2,6 +2,7 @@ import pywt
 import numpy as np
 import reedsolo
 from PIL import Image
+import os
 
 class DWT:
     @staticmethod
@@ -58,63 +59,72 @@ class DWT:
                 binary_data.extend(map(str, bits))
                 
         return ''.join(binary_data)
-
+    
     @staticmethod
     def encode_message(image_path, message):
         """
-        Виконує кодування повідомлення в зображення за допомогою DWT і Reed-Solomon.
-        :param image_path: Шлях до зображення для вбудовування повідомлення.
-        :param message: Повідомлення для вбудовування.
+        Вбудує повідомлення в зображення, перезаписуючи той самий файл `_encoded.png`.
         """
-        image = Image.open(image_path)
-        if image is None:
-            raise FileNotFoundError("Зображення не знайдено!")
+        original_message = message
+        max_attempts = 10
+        attempt = 0
 
-        arr = np.array(image)
+        # Фінальний шлях для збереження (завжди однаковий)
+        base, ext = os.path.splitext(image_path)
+        encoded_image_path = f"{base}_encoded.png"
 
-        # DWT тільки для червоного каналу
-        coeffs_r = pywt.dwt2(arr[:,:,0], 'haar')
-        LL_r, (LH_r, HL_r, HH_r) = coeffs_r
+        while attempt < max_attempts:
+            attempt += 1
+            print(f"Спроба {attempt}...")
 
-        # Повідомлення для вбудовування
-        binary_message = ''.join(format(ord(i), '08b') for i in message)
-        binary_message += '00000000'  # Додаємо стоп-байт
+            # Відкриваємо оригінал або останню версію
+            img = Image.open(image_path if attempt == 1 else encoded_image_path).convert('RGB')
+            arr = np.array(img)
 
-        # Кодування Ріда-Соломона
-        rs = reedsolo.RSCodec(20)  # Збільшено кількість перевірочних символів
-        
-        try:
-            # Перетворення повідомлення в байти
-            byte_data = bytes(int(binary_message[i:i+8], 2) for i in range(0, len(binary_message), 8))
+            # DWT для червоного каналу
+            coeffs_r = pywt.dwt2(arr[:, :, 0], 'haar')
+            LL_r, (LH_r, HL_r, HH_r) = coeffs_r
+
+            # Підготовка повідомлення з Reed-Solomon
+            binary_message = ''.join(format(ord(i), '08b') for i in message) + '00000000'
+            rs = reedsolo.RSCodec(20)
             
-            # Кодування Ріда-Соломона
-            encoded_data = rs.encode(byte_data)
-            encoded_binary = ''.join(format(byte, '08b') for byte in encoded_data)
-        except reedsolo.ReedSolomonError as e:
-            print(f"Помилка кодування Reed-Solomon: {e}")
-            encoded_binary = binary_message  # Якщо помилка, використовуємо оригінал
+            try:
+                byte_data = bytes(int(binary_message[i:i+8], 2) for i in range(0, len(binary_message), 8))
+                encoded_data = rs.encode(byte_data)
+                encoded_binary = ''.join(format(byte, '08b') for byte in encoded_data)
+            except reedsolo.ReedSolomonError as e:
+                print(f"Помилка Reed-Solomon: {e}")
+                encoded_binary = binary_message
 
-        # Вбудовування закодованого повідомлення ТІЛЬКИ в HH_r
-        DWT.embed_bits_with_rs(HH_r, encoded_binary)
+            # Вбудовування даних у HH_r
+            DWT.embed_bits_with_rs(HH_r, encoded_binary)
 
-        # Зворотнє DWT (IDWT) тільки для червоного каналу
-        R_rec = pywt.idwt2((LL_r, (LH_r, HL_r, HH_r)), 'haar')
-        
-        # Зберігаємо інші канали без змін
-        G_rec = arr[:,:,1]
-        B_rec = arr[:,:,2]
+            # Зворотнє DWT
+            R_rec = pywt.idwt2((LL_r, (LH_r, HL_r, HH_r)), 'haar')
+            h, w = arr.shape[:2]
+            R_rec = R_rec[:h, :w]
 
-        # Об'єднання каналів
-        reconstructed = np.stack([
-            np.clip(R_rec, 0, 255),
-            G_rec,
-            B_rec
-        ], axis=-1).astype(np.uint8)
+            # Зшиваємо канали
+            reconstructed = np.stack([
+                np.clip(R_rec, 0, 255),
+                arr[:, :, 1],
+                arr[:, :, 2]
+            ], axis=-1).astype(np.uint8)
 
-        # Збереження у форматі PNG
-        #Image.fromarray(reconstructed).save(image_path, compress_level=0)
+            # Зберігаємо в ТОЙ САМИЙ ФАЙЛ (_encoded.png)
+            Image.fromarray(reconstructed).save(encoded_image_path, format='PNG', compress_level=0)
 
-        Image.fromarray(reconstructed).save(image_path.replace('.jpg', '.png'), format='PNG', compress_level=0)
+            # Перевірка
+            decoded_message = DWT.decode_message(encoded_image_path)
+            if decoded_message == original_message:
+                print(f"✅ Успіх після {attempt} спроб!")
+                return encoded_image_path
+            
+            print(f"⚠ Не співпало: '{decoded_message}' != '{original_message}'")
+
+        print(f"❌ Досягнуто максимум спроб ({max_attempts}).")
+        return encoded_image_path
 
     @staticmethod
     def decode_message(image_path):
